@@ -5,7 +5,7 @@ use tx;
 use coin;
 use address;
 use hash;
-use config::{ProtocolMagic};
+use config::{ChainParameters};
 use cbor_event::{self, se};
 use std::{collections::{BTreeSet, HashSet}, fmt, error};
 use merkle;
@@ -20,20 +20,24 @@ pub enum Error {
     BadUpdateProposalSig,
     BadUpdateVoteSig,
     BadVssCertSig,
+    BlockTooBig,
     DuplicateInputs,
     DuplicateSigningKeys,
     DuplicateVSSKeys,
     EncodingError(cbor_event::Error),
-    UnexpectedWitnesses,
+    HeaderTooBig,
     MissingWitnesses,
-    RedeemOutput,
     NoInputs,
     NoOutputs,
+    ProposalTooBig,
+    RedeemOutput,
     SelfSignedPSK,
+    TxTooBig,
+    UnexpectedWitnesses,
     WrongBlockHash,
+    WrongBoundaryProof,
     WrongDelegationProof,
     WrongExtraDataProof,
-    WrongBoundaryProof,
     WrongMagic,
     WrongMerkleRoot,
     WrongMpcProof,
@@ -55,6 +59,12 @@ pub enum Error {
     FeeError(fee::Error),
     AddressMismatch,
     DuplicateTxo,
+    UnknownProposer,
+    UnknownVoter,
+    InsufficientProposerStake,
+    InsufficientVoterStake,
+    MissingProposal,
+    WrongBlockVersion(BlockVersion),
 }
 
 impl fmt::Display for Error {
@@ -66,16 +76,20 @@ impl fmt::Display for Error {
             BadUpdateProposalSig => write!(f, "invalid update proposal signature"),
             BadUpdateVoteSig => write!(f, "invalid update vote signature"),
             BadVssCertSig => write!(f, "invalid VSS certificate signature"),
+            BlockTooBig => write!(f, "block is too big"),
             DuplicateInputs => write!(f, "duplicated inputs"),
             DuplicateSigningKeys => write!(f, "duplicated signing keys"),
             DuplicateVSSKeys => write!(f, "duplicated VSS keys"),
             EncodingError(_error) => write!(f, "encoding error"),
+            HeaderTooBig => write!(f, "header is too big"),
             UnexpectedWitnesses => write!(f, "transaction has more witnesses than inputs"),
             MissingWitnesses => write!(f, "transaction has more inputs than witnesses"),
             RedeemOutput => write!(f, "invalid redeem output"),
             NoInputs => write!(f, "transaction has no inputs"),
             NoOutputs => write!(f, "transaction has no outputs"),
+            ProposalTooBig => write!(f, "update proposal is too big"),
             SelfSignedPSK => write!(f, "invalid self signing PSK"),
+            TxTooBig => write!(f, "transaction is too big"),
             WrongBlockHash => write!(f, "block hash is invalid"),
             WrongDelegationProof => write!(f, "delegation proof is invalid"),
             WrongExtraDataProof => write!(f, "extra data proof is invalid"),
@@ -99,6 +113,12 @@ impl fmt::Display for Error {
             WrongRedeemTxId => write!(f, "transaction input's ID does not match redeem public key"),
             AddressMismatch => write!(f, "transaction input witness does not match utxo address"),
             DuplicateTxo => write!(f, "transaction has an output that already exists"),
+            UnknownProposer => write!(f, "update proposer is unknown"),
+            UnknownVoter => write!(f, "update voter is unknown"),
+            InsufficientProposerStake => write!(f, "update proposer does not have sufficient stake to be allowed to "),
+            InsufficientVoterStake => write!(f, "update voter does not have sufficient stake to be allowed to vote"),
+            MissingProposal => write!(f, "vote for non-existent update proposal"),
+            WrongBlockVersion(version) => write!(f, "block version {} is neither the currently adopted version nor a competing version", version),
         }
     }
 }
@@ -118,21 +138,22 @@ impl error::Error for Error {
 }
 
 pub trait Verify {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error>;
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error>;
 }
 
-pub fn verify_block(protocol_magic: ProtocolMagic,
+pub fn verify_block(chain_parameters: &ChainParameters,
                     block_hash: &HeaderHash,
-                    blk: &Block) -> Result<(), Error>
+                    blk: &Block,
+                    rblk: &RawBlock) -> Result<(), Error>
 {
     match blk {
 
         Block::BoundaryBlock(blk) => {
-            blk.verify(protocol_magic)?;
+            blk.verify(chain_parameters)?;
         },
 
         Block::MainBlock(blk) => {
-            blk.verify(protocol_magic)?;
+            blk.verify(chain_parameters)?;
         }
     };
 
@@ -140,15 +161,28 @@ pub fn verify_block(protocol_magic: ProtocolMagic,
         return Err(Error::WrongBlockHash);
     }
 
+    // Verify that the encoded block is not bigger than the current
+    // limit.
+    if rblk.as_ref().len() as u64 > chain_parameters.max_block_size {
+        return Err(Error::BlockTooBig);
+    }
+
     Ok(())
 }
 
 impl Verify for boundary::Block {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error> {
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error> {
         let hdr = &self.header;
 
-        if hdr.protocol_magic != protocol_magic {
+        if hdr.protocol_magic != chain_parameters.protocol_magic {
             return Err(Error::WrongMagic);
+        }
+
+        // Verify that the encoded header is not bigger than the current
+        // limit. FIXME: find a way to prevent CBOR-encoding a value that
+        // we just decoded.
+        if cbor!(hdr)?.len() as u64 > chain_parameters.max_header_size {
+            return Err(Error::HeaderTooBig);
         }
 
         // check body proof
@@ -161,12 +195,19 @@ impl Verify for boundary::Block {
 }
 
 impl Verify for normal::Block {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error> {
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error> {
         let hdr = &self.header;
         let body = &self.body;
 
-        if hdr.protocol_magic != protocol_magic {
+        if hdr.protocol_magic != chain_parameters.protocol_magic {
             return Err(Error::WrongMagic);
+        }
+
+        // Verify that the encoded header is not bigger than the current
+        // limit. FIXME: find a way to prevent CBOR-encoding a value that
+        // we just decoded.
+        if cbor!(hdr)?.len() as u64 > chain_parameters.max_header_size {
+            return Err(Error::HeaderTooBig);
         }
 
         // check extra data
@@ -175,16 +216,16 @@ impl Verify for normal::Block {
         // enforced by the SoftwareVersion constructor.
 
         // check tx
-        body.tx.iter().try_for_each(|txaux| txaux.verify(protocol_magic))?;
+        body.tx.iter().try_for_each(|txaux| txaux.verify(chain_parameters))?;
 
         // check ssc
-        body.ssc.get_vss_certificates().verify(protocol_magic)?;
+        body.ssc.get_vss_certificates().verify(chain_parameters)?;
 
         // check delegation
         // TODO
 
         // check update
-        body.update.verify(protocol_magic)?;
+        body.update.verify(chain_parameters)?;
 
         // check tx merkle root
         let mut txs = vec![];
@@ -300,7 +341,7 @@ impl Verify for normal::Block {
                     extra_data: &hdr.extra_data,
                 };
 
-                if !verify_proxy_sig(protocol_magic, tags::SigningTag::MainBlockHeavy, proxy_sig, &to_sign) {
+                if !verify_proxy_sig(chain_parameters, tags::SigningTag::MainBlockHeavy, proxy_sig, &to_sign) {
                     return Err(Error::BadBlockSig);
                 }
             }
@@ -311,12 +352,12 @@ impl Verify for normal::Block {
 }
 
 impl Verify for update::UpdatePayload {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error> {
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error> {
         if let Some(proposal) = &self.proposal {
-            proposal.verify(protocol_magic)?;
+            proposal.verify(chain_parameters)?;
         }
 
-        self.votes.iter().try_for_each(|vote| vote.verify(protocol_magic))?;
+        self.votes.iter().try_for_each(|vote| vote.verify(chain_parameters))?;
 
         Ok(())
     }
@@ -350,7 +391,7 @@ impl<'a> cbor_event::se::Serialize for MainToSign<'a> {
 }
 
 pub fn verify_proxy_sig<T>(
-    protocol_magic: ProtocolMagic,
+    chain_parameters: &ChainParameters,
     tag: tags::SigningTag,
     proxy_sig: &ProxySignature,
     data: &T)
@@ -363,7 +404,7 @@ pub fn verify_proxy_sig<T>(
 
     se::Serializer::new(&mut buf)
         .serialize(&(tag as u8)).unwrap()
-        .serialize(&protocol_magic).unwrap()
+        .serialize(&chain_parameters.protocol_magic).unwrap()
         .serialize(data).unwrap();
 
     proxy_sig.psk.delegate_pk.verify(
@@ -371,7 +412,7 @@ pub fn verify_proxy_sig<T>(
 }
 
 impl Verify for tx::TxAux {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error>
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error>
     {
         // check that there are inputs
         if self.tx.inputs.is_empty() {
@@ -414,7 +455,7 @@ impl Verify for tx::TxAux {
         }
 
         self.witness.iter().try_for_each(|in_witness| {
-            if !in_witness.verify_tx(protocol_magic, &self.tx) {
+            if !in_witness.verify_tx(chain_parameters.protocol_magic, &self.tx) {
                 return Err(Error::BadTxWitness);
             }
             Ok(())
@@ -429,12 +470,18 @@ impl Verify for tx::TxAux {
             }
         }
 
+        // verify that the encoded transaction is not bigger than the current limit
+        // FIXME: find a way to prevent CBOR-encoding a value that we just decoded.
+        if cbor!(self)?.len() as u64 > chain_parameters.max_tx_size {
+            return Err(Error::TxTooBig);
+        }
+
         Ok(())
     }
 }
 
 impl Verify for VssCertificates {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error> {
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error> {
         // check that there are no duplicate VSS keys
         let mut vss_keys = BTreeSet::new();
         if !self.iter().all(|x| vss_keys.insert(x.vss_key.clone())) {
@@ -454,7 +501,7 @@ impl Verify for VssCertificates {
             {
                 let serializer = se::Serializer::new(&mut buf)
                     .serialize(&(tags::SigningTag::VssCert as u8)).unwrap()
-                    .serialize(&protocol_magic).unwrap();
+                    .serialize(&chain_parameters.protocol_magic).unwrap();
                 let serializer = serializer.write_array(cbor_event::Len::Len(2))?;
                 serializer
                     .serialize(&vss_cert.vss_key).unwrap()
@@ -471,8 +518,15 @@ impl Verify for VssCertificates {
 }
 
 impl Verify for update::UpdateProposal {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error>
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error>
     {
+        // Verify that the encoded proposal is not bigger than the
+        // current limit. FIXME: find a way to prevent CBOR-encoding a
+        // value that we just decoded.
+        if cbor!(self)?.len() as u64 > chain_parameters.max_proposal_size {
+            return Err(Error::ProposalTooBig);
+        }
+
         // CoinPortion fields in block_version_mod and
         // block_version_mod.softfork_rule are checked by
         // CoinPortion::new().
@@ -494,7 +548,7 @@ impl Verify for update::UpdateProposal {
 
         se::Serializer::new(&mut buf)
             .serialize(&(tags::SigningTag::USProposal as u8)).unwrap()
-            .serialize(&protocol_magic).unwrap()
+            .serialize(&chain_parameters.protocol_magic).unwrap()
             .serialize(&to_sign).unwrap();
 
         if !self.from.verify(&buf, &Signature::<()>::from_bytes(*self.signature.to_bytes())) {
@@ -506,12 +560,12 @@ impl Verify for update::UpdateProposal {
 }
 
 impl Verify for update::UpdateVote {
-    fn verify(&self, protocol_magic: ProtocolMagic) -> Result<(), Error>
+    fn verify(&self, chain_parameters: &ChainParameters) -> Result<(), Error>
     {
         let mut buf = vec![];
         se::Serializer::new(&mut buf)
             .serialize(&(tags::SigningTag::USVote as u8)).unwrap()
-            .serialize(&protocol_magic).unwrap()
+            .serialize(&chain_parameters.protocol_magic).unwrap()
             .serialize(&(&self.proposal_id, &self.decision)).unwrap();
 
         if !self.key.verify(&buf, &Signature::<()>::from_bytes(*self.signature.to_bytes())) {
@@ -526,12 +580,13 @@ impl Verify for update::UpdateVote {
 mod tests {
     use std::str::FromStr;
     use block::*;
-    use config::{ProtocolMagic};
+    use config::{ProtocolMagic, ChainParameters};
     use std::mem;
     use coin;
     use merkle;
     use address;
     use cbor_event;
+    use fee;
     use std::fmt::Debug;
 
     #[test]
@@ -576,30 +631,48 @@ mod tests {
 
     #[test]
     fn test_verify() {
+        let params = ChainParameters {
+            protocol_magic: ProtocolMagic::new(PROTOCOL_MAGIC),
+            epoch_stability_depth: 2160,
+            max_block_size: 2000000,
+            max_header_size: 2000000,
+            max_tx_size: 4096,
+            max_proposal_size: 700,
+            softfork_init_thd: 900000000000000,
+            softfork_min_thd: 600000000000000,
+            softfork_thd_decrement: 50000000000000,
+            fee_policy: fee::LinearFee::new(fee::Milli(43946), fee::Milli(155381000)),
+            update_proposal_thd: 100000000000000,
+            update_vote_thd: 1000000000000,
+        };
+
         let hash = HeaderHash::from_str(&HEADER_HASH1).unwrap();
         let rblk = RawBlock(BLOCK1.to_vec());
         let blk = rblk.decode().unwrap();
-        let pm = ProtocolMagic::new(PROTOCOL_MAGIC);
-        assert!(verify_block(pm, &hash, &blk).is_ok());
+        assert!(verify_block(&params, &hash, &blk, &rblk).is_ok());
 
         let hash2 = HeaderHash::from_str(&HEADER_HASH2).unwrap();
         let rblk2 = RawBlock(BLOCK2.to_vec());
         let blk2 = rblk2.decode().unwrap();
-        assert!(verify_block(pm, &hash2, &blk2).is_ok());
+        assert!(verify_block(&params, &hash2, &blk2, &rblk2).is_ok());
 
         let hash3 = HeaderHash::from_str(&HEADER_HASH3).unwrap();
         let rblk3 = RawBlock(BLOCK3.to_vec());
         let blk3 = rblk3.decode().unwrap();
-        assert!(verify_block(pm, &hash3, &blk3).is_ok());
+        assert!(verify_block(&params, &hash3, &blk3, &rblk3).is_ok());
 
         // invalidate the protocol magic
-        expect_error(&verify_block(ProtocolMagic::new(123), &hash, &blk), Error::WrongMagic);
+        {
+            let mut params = params.clone();
+            params.protocol_magic = ProtocolMagic::new(123);
+            expect_error(&verify_block(&params, &hash, &blk, &rblk), Error::WrongMagic);
+        }
 
         // use a wrong header hash
         {
             expect_error(&verify_block(
-                pm, &HeaderHash::from_str(&"ae443ffffe52cc29de83312d2819b3955fc306ce65ae6aa5b26f1d3c76e91841").unwrap(),
-                &blk), Error::WrongBlockHash);
+                &params, &HeaderHash::from_str(&"ae443ffffe52cc29de83312d2819b3955fc306ce65ae6aa5b26f1d3c76e91841").unwrap(),
+                &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::WrongBlockHash);
         }
 
         // duplicate a tx input
@@ -609,7 +682,7 @@ mod tests {
                 let input = mblk.body.tx[0].tx.inputs[0].clone();
                 mblk.body.tx[0].tx.inputs.push(input);
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::DuplicateInputs);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::DuplicateInputs);
         }
 
         // invalidate a transaction witness
@@ -618,7 +691,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.tx[0].tx.outputs[0].value = coin::Coin::new(123).unwrap();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::BadTxWitness);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::BadTxWitness);
         }
 
         // create a zero output
@@ -627,7 +700,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.tx[0].tx.outputs[0].value = coin::Coin::new(0).unwrap();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::ZeroCoin);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::ZeroCoin);
         }
 
         // create a redeem output
@@ -636,7 +709,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.tx[0].tx.outputs[0].address.addr_type = address::AddrType::ATRedeem;
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::RedeemOutput);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::RedeemOutput);
         }
 
         // remove the transaction input witness
@@ -645,7 +718,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.tx[0].witness.clear();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::MissingWitnesses);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::MissingWitnesses);
         }
 
         // add a transaction input witness
@@ -655,7 +728,7 @@ mod tests {
                 let in_witness = mblk.body.tx[0].witness[0].clone();
                 mblk.body.tx[0].witness.push(in_witness);
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::UnexpectedWitnesses);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::UnexpectedWitnesses);
         }
 
         // remove all transaction inputs
@@ -664,7 +737,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.tx[0].tx.inputs.clear();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::NoInputs);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::NoInputs);
         }
 
         // remove all transaction outputs
@@ -673,7 +746,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.tx[0].tx.outputs.clear();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::NoOutputs);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::NoOutputs);
         }
 
         // invalidate the Merkle root by deleting a transaction
@@ -682,7 +755,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.tx.pop();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::WrongMerkleRoot);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::WrongMerkleRoot);
         }
 
         // invalidate the tx proof
@@ -698,7 +771,7 @@ mod tests {
                 }
                 mblk.header.body_proof.tx.root = merkle::MerkleTree::new(&txs).get_root_hash();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::WrongTxProof);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::WrongTxProof);
         }
 
         // invalidate the block signature
@@ -707,7 +780,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.header.previous_header = HeaderHash::from_str(&"aaaaaaaaaaaaaaa9de83312d2819b3955fc306ce65ae6aa5b26f1d3c76e91841").unwrap();
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::BadBlockSig);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::BadBlockSig);
         }
 
         // invalidate a VSS certificate
@@ -721,7 +794,7 @@ mod tests {
                     _ => panic!()
                 }
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::BadVssCertSig);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::BadVssCertSig);
         }
 
         // duplicate a VSS certificate
@@ -736,7 +809,7 @@ mod tests {
                     _ => panic!()
                 }
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::DuplicateVSSKeys);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::DuplicateVSSKeys);
         }
 
         // invalidate the MPC proof
@@ -746,7 +819,7 @@ mod tests {
                 mblk.body.ssc = normal::SscPayload::CertificatesPayload(
                     normal::VssCertificates::new(vec![]));
             }
-            expect_error(&verify_block(pm, &hash, &blk), Error::WrongMpcProof);
+            expect_error(&verify_block(&params, &hash, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::WrongMpcProof);
         }
 
         // invalidate the update proof
@@ -755,7 +828,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.update.proposal = None;
             }
-            expect_error(&verify_block(pm, &hash2, &blk), Error::WrongUpdateProof);
+            expect_error(&verify_block(&params, &hash2, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::WrongUpdateProof);
         }
 
         // invalidate the update proposal signature
@@ -764,7 +837,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.update.proposal.as_mut().unwrap().block_version.major = 123;
             }
-            expect_error(&verify_block(pm, &hash2, &blk), Error::BadUpdateProposalSig);
+            expect_error(&verify_block(&params, &hash2, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::BadUpdateProposalSig);
         }
 
         // invalidate the update vote signature
@@ -773,7 +846,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.update.votes[0].decision = false;
             }
-            expect_error(&verify_block(pm, &hash2, &blk), Error::BadUpdateVoteSig);
+            expect_error(&verify_block(&params, &hash2, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::BadUpdateVoteSig);
         }
 
         // invalidate the extra data proof
@@ -782,7 +855,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.extra = cbor_event::Value::U64(123);
             }
-            expect_error(&verify_block(pm, &hash2, &blk), Error::WrongExtraDataProof);
+            expect_error(&verify_block(&params, &hash2, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::WrongExtraDataProof);
         }
 
         // invalidate the delegation proof
@@ -791,7 +864,7 @@ mod tests {
             if let Block::MainBlock(mblk) = &mut blk {
                 mblk.body.delegation = cbor_event::Value::U64(123);
             }
-            expect_error(&verify_block(pm, &hash2, &blk), Error::WrongDelegationProof);
+            expect_error(&verify_block(&params, &hash2, &blk, &RawBlock::from_dat(cbor!(blk).unwrap())), Error::WrongDelegationProof);
         }
 
         // add trailing data
