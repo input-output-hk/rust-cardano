@@ -126,6 +126,26 @@ macro_rules! try_open {
 }
 
 impl Storage {
+    // The load function should not create any dirs.
+    pub fn load(cfg: &StorageConfig) -> Result<Self> {
+        let mut lookups = BTreeMap::new();
+
+        // TODO: Check the index path first.
+        // if it does not exit then throw an error.
+        let packhashes = cfg.list_indexes();
+        for p in packhashes.iter() {
+            match pack::read_index_fanout(&cfg, p) {
+                Err(_) => {}
+                Ok(lookup) => {
+                    lookups.insert(*p, lookup);
+                }
+            }
+        }
+
+        let storage = Storage { config: cfg.clone(), lookups: lookups };
+        Ok(storage)
+    }
+
     pub fn init(cfg: &StorageConfig) -> Result<Self> {
         let mut lookups = BTreeMap::new();
 
@@ -137,6 +157,9 @@ impl Storage {
         fs::create_dir_all(cfg.get_filetype_dir(StorageFileType::RefPack))?;
         fs::create_dir_all(cfg.get_filetype_dir(StorageFileType::ChainState))?;
 
+        // There should NOT be any indexes at the blockchain initialisation stage.
+        // Therefore, just simply create a Storage with an empty lookups.
+        /*
         let packhashes = cfg.list_indexes();
         for p in packhashes.iter() {
             match pack::read_index_fanout(&cfg, p) {
@@ -146,6 +169,7 @@ impl Storage {
                 }
             }
         }
+        */
 
         let storage = Storage {
             config: cfg.clone(),
